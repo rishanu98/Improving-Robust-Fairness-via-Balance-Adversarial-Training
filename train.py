@@ -7,12 +7,19 @@ import torch.nn.functional as F
 import torchvision
 import torch.optim as optim
 from torchvision import datasets, transforms
-from models.wideresnet import *
+from models.wide_resnet import *
 from models.resnet import *
+#from models import *
 from train_mode.stop_to_lastclean import *
 from train_mode.stop_to_firstadv import *
 import torchvision.models as models
 import random
+
+from sklearn.metrics import confusion_matrix
+import numpy as np
+import seaborn as sn
+import pandas as pd
+import matplotlib.pyplot as plt
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR TRADES Adversarial Training')
 parser.add_argument('--batch-size', type=int, default=128, metavar='N',
@@ -70,6 +77,7 @@ trainset = torchvision.datasets.CIFAR10(root='./data/cifar10', train=True, downl
 train_loader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size, shuffle=True, **kwargs)
 testset = torchvision.datasets.CIFAR10(root='./data/cifar10', train=False, download=True, transform=transform_test)
 test_loader = torch.utils.data.DataLoader(testset, batch_size=args.test_batch_size, shuffle=False, **kwargs)
+class_names = trainset.classes
 
 def BAT_loss(firstadv_logits, lastclean_logits, target, beta, clean_logits):
     batch_size = len(target)
@@ -95,13 +103,24 @@ def train(args, model, device, train_loader, optimizer, epoch, ema=None):
             print_flag = True
         else:
             print_flag = False
+
+        target_classes = torch.randint(3,7,(target.size(0),)).to(device)   # create a target class tensor which only includes hard classes 
+
+        assert target_classes.shape == target.shape, "Shapes do not match"
+
+        if torch.equal(target, target_classes):
+        
+            mixed_inputs, mixed_labels = mixup_data(data, target)
+        else:
+            mixed_inputs = data
+            mixed_labels = target
         
 
-        last_clean, lastclean_target, _, _ = stop_to_lastclean(model, data, target, print_flag, step_size=args.step_size,
+        last_clean, lastclean_target, _, _ = stop_to_lastclean(model, mixed_inputs, mixed_labels, print_flag, step_size=args.step_size,
                                                                     epsilon=args.epsilon, perturb_steps=args.num_steps,
                                                                     randominit_type="normal_distribution_randominit", loss_fn='kl') 
 
-        first_adv, _, output_natural, _ = stop_to_firstadv(model, data, target, step_size=args.step_size,
+        first_adv, _, output_natural, _ = stop_to_firstadv(model, mixed_inputs, mixed_labels, step_size=args.step_size,
                                                                     epsilon=args.epsilon, perturb_steps=args.num_steps,
                                                                     randominit_type="normal_distribution_randominit", loss_fn='kl',tau=1) 
 
@@ -143,11 +162,32 @@ def eval_train(model, device, train_loader):
     training_accuracy = correct / len(train_loader.dataset)
     return train_loss, training_accuracy
 
+def mixup_data(x, y, alpha = 0.2, device='cuda'):
+    '''Returns mixed inputs, pairs of targets, and lambda'''
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha).cpu()
+    else:
+        lam = np.random.beta(alpha, alpha).cpu()
+
+    batch_size = x.size()[0]
+
+    if device == 'cuda':
+        index = torch.randperm(batch_size).cuda() # generates a random permutation of indices for shuffling the samples. This is used to select a random sample from the dataset to mix with the current sample.
+    else:
+        index = torch.randperm(batch_size)
+        
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    mixed_y = lam * y_a + (1 - lam) * y_b
+    return mixed_x, mixed_y
+
 
 def eval_test(model, device, test_loader):
     model.eval()
     test_loss = 0
     correct = 0
+    True_label = []
+    predicted_label = []
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
@@ -155,11 +195,32 @@ def eval_test(model, device, test_loader):
             test_loss += F.cross_entropy(output, target, size_average=False).item()
             pred = output.max(1, keepdim=True)[1]
             correct += pred.eq(target.view_as(pred)).sum().item()
+            # Transfering data on cpu to plot confusion matrix
+            True_label.extend(target.cpu().numpy())
+            predicted_label.extend(pred.cpu().numpy())
     test_loss /= len(test_loader.dataset)
     print('Test: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)'.format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
     test_accuracy = correct / len(test_loader.dataset)
+    conf_matrix = confusion_matrix(True_label, predicted_label)
+
+    targ_df_cm = pd.DataFrame(conf_matrix / np.sum(conf_matrix, axis=1)[:, None], index = [i for i in class_names],
+                     columns = [i for i in class_names])
+    
+    plt.figure(figsize=(8, 6))
+    sn.heatmap(targ_df_cm, annot=True, cmap='Blues', cbar=False)
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Confusion Matrix for Targeted Attacks(Mix-Up)')
+
+
+    plt.tight_layout()
+
+    plt.savefig('Conf_Mat_BAT_MIX.png')
+
+    plt.show()
+
     return test_loss, test_accuracy
 
 
@@ -176,7 +237,7 @@ def adjust_learning_rate(optimizer, epoch):
         param_group['lr'] = lr
 
 def main():
-    model = ResNet18(num_classes = 10)
+    model = ResNet18()
     model = nn.DataParallel(model)
     model = model.cuda()
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
